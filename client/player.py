@@ -66,17 +66,51 @@ class Player(FirstPersonController):
             ursina.Vec3(6, 1, -6),
         ]
 
-        self.death_title = None
-        self.death_subtitle = None
-        self.respawn_button = None
-        self.timer_text = None
+        # Persistent Death Screen UI elements (no destruction / recreation)
+        self.death_title = ursina.Text(
+            text="YOU DIED",
+            origin=ursina.Vec2(0, 0),
+            y=0.2,
+            scale=3.5,
+            color=ursina.color.red,
+            enabled=False
+        )
+
+        self.death_subtitle = ursina.Text(
+            text="Press [R] or [SPACE] to Respawn  |  [ESC] to Exit",
+            origin=ursina.Vec2(0, 0),
+            y=0.08,
+            scale=1.3,
+            color=ursina.color.white,
+            enabled=False
+        )
+
+        self.respawn_button = ursina.Button(
+            text="RESPAWN",
+            color=ursina.color.azure,
+            highlight_color=ursina.color.cyan,
+            scale=ursina.Vec2(0.25, 0.08),
+            position=ursina.Vec2(0, -0.05),
+            on_click=self.respawn,
+            enabled=False
+        )
+
         self.respawn_timer = 0
+        self.timer_text = ursina.Text(
+            text="Auto-respawn in 5s...",
+            origin=ursina.Vec2(0, 0),
+            y=-0.14,
+            scale=1.1,
+            color=ursina.color.light_gray,
+            enabled=False
+        )
 
     def death(self):
         if self.death_message_shown:
             return
         self.death_message_shown = True
 
+        self.gravity = 0
         self.gun.enabled = False
         self.healthbar.enabled = False
         self.healthbar_bg.enabled = False
@@ -92,39 +126,12 @@ class Player(FirstPersonController):
         if self.network:
             self.network.send_player(self)
 
-        self.death_title = ursina.Text(
-            text="YOU DIED",
-            origin=ursina.Vec2(0, 0),
-            y=0.2,
-            scale=3.5,
-            color=ursina.color.red
-        )
-
-        self.death_subtitle = ursina.Text(
-            text="Press [R] or [SPACE] to Respawn  |  [ESC] to Exit",
-            origin=ursina.Vec2(0, 0),
-            y=0.08,
-            scale=1.3,
-            color=ursina.color.white
-        )
-
-        self.respawn_button = ursina.Button(
-            text="RESPAWN",
-            color=ursina.color.azure,
-            highlight_color=ursina.color.cyan,
-            scale=ursina.Vec2(0.25, 0.08),
-            position=ursina.Vec2(0, -0.05),
-            on_click=self.respawn
-        )
-
+        self.death_title.enabled = True
+        self.death_subtitle.enabled = True
+        self.respawn_button.enabled = True
         self.respawn_timer = 5.0
-        self.timer_text = ursina.Text(
-            text=f"Auto-respawn in {int(self.respawn_timer)}s...",
-            origin=ursina.Vec2(0, 0),
-            y=-0.14,
-            scale=1.1,
-            color=ursina.color.light_gray
-        )
+        self.timer_text.text = f"Auto-respawn in {int(self.respawn_timer)}s..."
+        self.timer_text.enabled = True
 
     def respawn(self):
         if not self.death_message_shown and self.health > 0:
@@ -132,19 +139,19 @@ class Player(FirstPersonController):
 
         import random
 
-        # Clean up death screen UI
-        for ui_element in (self.death_title, self.death_subtitle, self.respawn_button, self.timer_text):
-            if ui_element:
-                try:
-                    ursina.destroy(ui_element)
-                except Exception:
-                    pass
-        self.death_title = None
-        self.death_subtitle = None
-        self.respawn_button = None
-        self.timer_text = None
+        # Hide death UI elements safely without destroying them
+        if self.death_title:
+            self.death_title.enabled = False
+        if self.death_subtitle:
+            self.death_subtitle.enabled = False
+        if self.respawn_button:
+            self.respawn_button.enabled = False
+        if self.timer_text:
+            self.timer_text.enabled = False
 
         self.health = 100
+        self.gravity = 1
+        self.air_time = 0
         self.death_message_shown = False
 
         spawn_pos = random.choice(self.spawn_points)

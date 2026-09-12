@@ -1,5 +1,6 @@
 import os
 import sys
+import time
 import socket
 import threading
 import queue
@@ -165,9 +166,12 @@ app = ursina.Ursina(
     fullscreen=True,
 )
 
-ursina.window.borderless = False
-ursina.window.title = "Ursina FPS"
-ursina.window.exit_button.visible = False
+if hasattr(ursina.window, 'borderless'):
+    ursina.window.borderless = False
+if hasattr(ursina.window, 'title'):
+    ursina.window.title = "Ursina FPS"
+if hasattr(ursina.window, 'exit_button') and ursina.window.exit_button:
+    ursina.window.exit_button.enabled = False
 
 floor = Floor()
 map = Map()
@@ -179,76 +183,83 @@ sky = ursina.Entity(
 )
 
 player = Player(ursina.Vec3(0, 1, 0), n)
-prev_pos = player.world_position
+prev_pos = ursina.Vec3(player.world_position)
 prev_dir = player.world_rotation_y
 enemies = []
 msg_queue = queue.Queue()
+network_tick_rate = 1.0 / 30.0  # 30 updates per second
+last_network_send_time = 0.0
 
 def receive():
-    while True:
+    while n.running:
         try:
             info = n.receive_info()
         except Exception as e:
-            print(e)
+            print(f"[Network] Receive error: {e}")
             continue
 
         if not info:
-            print("Server has stopped! Exiting...")
-            msg_queue.put(None)
+            if n.running:
+                print("Server has stopped! Exiting...")
+                msg_queue.put(None)
             break
 
         msg_queue.put(info)
 
 
 def handle_server_info(info):
-    if info["object"] == "player":
-        enemy_id = info["id"]
-        if str(enemy_id) == str(n.id):
-            return
+    if not isinstance(info, dict):
+        return
 
-        if info["joined"]:
-            existing_enemy = None
-            for e in enemies:
-                if str(e.id) == str(enemy_id):
-                    existing_enemy = e
-                    break
-            if not existing_enemy:
-                new_enemy = Enemy(ursina.Vec3(*info["position"]), enemy_id, info["username"])
-                new_enemy.health = info["health"]
-                enemies.append(new_enemy)
+    obj_type = info.get("object")
+    if obj_type == "player":
+        enemy_id = str(info.get("id"))
+        if enemy_id == str(n.id):
             return
 
         enemy = None
         for e in enemies:
-            if str(e.id) == str(enemy_id):
+            if str(e.id) == enemy_id:
                 enemy = e
                 break
 
+        if info.get("left"):
+            if enemy:
+                enemies.remove(enemy)
+                enemy.cleanup()
+                try:
+                    ursina.destroy(enemy)
+                except Exception:
+                    pass
+            return
+
         if not enemy:
+            username = info.get("username", f"Player {enemy_id}")
+            pos = ursina.Vec3(*info["position"]) if "position" in info else ursina.Vec3(0, 1, 0)
+            new_enemy = Enemy(pos, enemy_id, username)
+            new_enemy.health = info.get("health", 100)
+            enemies.append(new_enemy)
             return
 
-        if info["left"]:
-            enemies.remove(enemy)
-            ursina.destroy(enemy)
-            return
-
-        enemy.world_position = ursina.Vec3(*info["position"])
-        enemy.rotation_y = info["rotation"]
+        if "position" in info:
+            enemy.world_position = ursina.Vec3(*info["position"])
+        if "rotation" in info:
+            enemy.rotation_y = info["rotation"]
 
         new_health = info.get("health", enemy.health)
         if enemy.health <= 0 and new_health > 0:
-            enemy.respawn(ursina.Vec3(*info["position"]), new_health)
+            enemy.respawn(enemy.world_position, new_health)
         else:
             enemy.health = new_health
 
-    elif info["object"] in ("player_respawn", "respawn"):
-        enemy_id = info.get("id")
-        if str(enemy_id) == str(n.id):
+    elif obj_type in ("player_respawn", "respawn"):
+        enemy_id = str(info.get("id"))
+        if enemy_id == str(n.id):
             return
 
         enemy = None
         for e in enemies:
-            if str(e.id) == str(enemy_id):
+            if str(e.id) == enemy_id:
                 enemy = e
                 break
 
@@ -257,27 +268,29 @@ def handle_server_info(info):
             health = info.get("health", 100)
             enemy.respawn(pos, health)
 
-    elif info["object"] == "bullet":
+    elif obj_type == "bullet":
         b_pos = ursina.Vec3(*info["position"])
         b_dir = info["direction"]
         b_x_dir = info["x_direction"]
-        b_damage = info["damage"]
-        new_bullet = Bullet(b_pos, b_dir, b_x_dir, n, b_damage, slave=True)
-        ursina.destroy(new_bullet, delay=2)
+        b_damage = info.get("damage", 10)
+        Bullet(b_pos, b_dir, b_x_dir, n, b_damage, slave=True)
 
-    elif info["object"] == "health_update":
-        enemy_id = info["id"]
-        if str(enemy_id) == str(n.id):
+    elif obj_type == "health_update":
+        enemy_id = str(info.get("id"))
+        if enemy_id == str(n.id):
             player.health = info["health"]
         else:
             for e in enemies:
-                if str(e.id) == str(enemy_id):
+                if str(e.id) == enemy_id:
                     e.health = info["health"]
                     break
 
 
 def update():
+    global last_network_send_time, prev_pos, prev_dir
+
     if ursina.held_keys['escape']:
+        n.close()
         exit()
 
     while not msg_queue.empty():
@@ -287,18 +300,22 @@ def update():
             break
 
         if info is None:
-            sys.exit()
+            n.close()
+            ursina.application.quit()
+            return
 
         handle_server_info(info)
 
     if player.health > 0:
-        global prev_pos, prev_dir
-
-        if prev_pos != player.world_position or prev_dir != player.world_rotation_y:
-            n.send_player(player)
-
-        prev_pos = player.world_position
-        prev_dir = player.world_rotation_y
+        current_time = time.time()
+        if (current_time - last_network_send_time) >= network_tick_rate:
+            pos_diff = (player.world_position - prev_pos).length()
+            rot_diff = abs(player.world_rotation_y - prev_dir)
+            if pos_diff > 0.01 or rot_diff > 0.5:
+                n.send_player(player)
+                prev_pos = ursina.Vec3(player.world_position)
+                prev_dir = player.world_rotation_y
+                last_network_send_time = current_time
 
 def input(key):
     if player.health <= 0:
@@ -308,9 +325,8 @@ def input(key):
 
     if key == "left mouse down" and player.health > 0:
         b_pos = player.position + ursina.Vec3(0, 2, 0)
-        bullet = Bullet(b_pos, player.world_rotation_y, -player.camera_pivot.world_rotation_x, n)
+        bullet = Bullet(b_pos, player.world_rotation_y, -player.camera_pivot.world_rotation_x, n, ignore_entity=player)
         n.send_bullet(bullet)
-        ursina.destroy(bullet, delay=2)
         try:
             player.gun_sound.play()
         except Exception:

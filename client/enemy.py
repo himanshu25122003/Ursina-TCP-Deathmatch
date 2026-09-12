@@ -73,10 +73,11 @@ class Enemy(ursina.Entity):
     def __init__(self, position: ursina.Vec3, identifier: str, username: str, color_rgb=None):
         # Initialize attributes early to prevent race condition crashes if update() is called during creation
         self.health = 100
-        self.id = identifier
+        self.id = str(identifier)
         self.username = username
         self.gun = None
         self.name_tag = None
+        self.is_dead = False
 
         if color_rgb is None:
             self.color_rgb = get_player_color(identifier, username)
@@ -116,22 +117,25 @@ class Enemy(ursina.Entity):
     def update(self):
         if not hasattr(self, 'health') or self.health is None:
             return
-        if not hasattr(self, 'gun') or not self.gun:
-            return
-        if not hasattr(self, 'name_tag') or not self.name_tag:
-            return
 
         if self.health <= 0:
-            self.visible = False
-            self.gun.visible = False
-            self.name_tag.visible = False
-            self.collider = None
+            if not self.is_dead:
+                self.is_dead = True
+                self.visible = False
+                if self.gun:
+                    self.gun.visible = False
+                if self.name_tag:
+                    self.name_tag.visible = False
+                self.collision = False
         else:
-            self.visible = True
-            self.gun.visible = True
-            self.name_tag.visible = True
-            if not self.collider:
-                self.collider = "box"
+            if self.is_dead:
+                self.is_dead = False
+                self.visible = True
+                if self.gun:
+                    self.gun.visible = True
+                if self.name_tag:
+                    self.name_tag.visible = True
+                self.collision = True
 
             try:
                 color_saturation = max(0.0, min(1.0, 1.0 - self.health / 100.0))
@@ -144,11 +148,21 @@ class Enemy(ursina.Entity):
     def respawn(self, position: ursina.Vec3, health: int = 100):
         self.world_position = position
         self.health = health
+        self.is_dead = False
         self.visible = True
         if hasattr(self, 'gun') and self.gun:
             self.gun.visible = True
         if hasattr(self, 'name_tag') and self.name_tag:
             self.name_tag.visible = True
-        self.collider = "box"
+        self.collision = True
         self.color = ursina.color.hsv(0, 0, 1)
+
+    def cleanup(self):
+        self.collision = False
+        self.enabled = False
+        if hasattr(self, 'gun') and self.gun:
+            self.gun.enabled = False
+        if hasattr(self, 'name_tag') and self.name_tag:
+            self.name_tag.enabled = False
+
 

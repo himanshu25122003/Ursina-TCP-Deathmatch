@@ -1,6 +1,7 @@
 import socket
 import json
-
+import threading
+import queue
 
 
 class Network:
@@ -18,45 +19,91 @@ class Network:
         self.addr = server_addr
         self.port = server_port
         self.username = username
-        self.recv_size = 2048
+        self.recv_size = 4096
         self.id = 0
+        self.recv_buffer = ""
+        self.decoder = json.JSONDecoder()
+        self.outgoing_queue = queue.Queue()
+        self.running = True
+        self.send_thread = None
 
     def settimeout(self, value):
         self.client.settimeout(value)
 
     def connect(self):
         """
-        Connect to the server and get a unique identifier
+        Connect to the server, negotiate ID/username, and start background send thread.
         """
-
         self.client.connect((self.addr, self.port))
-        self.id = self.client.recv(self.recv_size).decode("utf8")
-        self.client.send(self.username.encode("utf8"))
+        raw = self.client.recv(self.recv_size).decode("utf8", errors="ignore")
+        if "\n" in raw:
+            parts = raw.split("\n", 1)
+            self.id = parts[0].strip()
+            self.recv_buffer += parts[1]
+        else:
+            self.id = raw.strip()
+
+        self.client.sendall(f"{self.username}\n".encode("utf8"))
+
+        # Start non-blocking send worker thread so main game loop never hangs on socket I/O
+        self.send_thread = threading.Thread(target=self._send_loop, daemon=True)
+        self.send_thread.start()
+
+    def _send_loop(self):
+        while self.running:
+            try:
+                data = self.outgoing_queue.get(timeout=0.2)
+            except queue.Empty:
+                continue
+
+            try:
+                self.client.sendall(data)
+            except (socket.error, OSError) as e:
+                print(f"[Network] Send error: {e}")
+                self.running = False
+                break
+
+    def queue_send(self, data_dict):
+        if not self.running:
+            return
+        try:
+            payload = (json.dumps(data_dict) + "\n").encode("utf8")
+            self.outgoing_queue.put_nowait(payload)
+        except Exception as e:
+            print(f"[Network] Error queuing message: {e}")
 
     def receive_info(self):
-        msg = None
-        try:
-            msg = self.client.recv(self.recv_size)
-        except socket.error as e:
-            print(e)
-            return None
+        """
+        Stream parser for incoming JSON messages over TCP.
+        Handles coalesced and fragmented packets without dropping messages.
+        """
+        while self.running:
+            # First parse any complete JSON object already in buffer
+            idx = 0
+            while idx < len(self.recv_buffer) and self.recv_buffer[idx] in ' \t\r\n':
+                idx += 1
+            if idx < len(self.recv_buffer):
+                try:
+                    msg_json, end_idx = self.decoder.raw_decode(self.recv_buffer, idx)
+                    self.recv_buffer = self.recv_buffer[end_idx:]
+                    return msg_json
+                except json.JSONDecodeError:
+                    self.recv_buffer = self.recv_buffer[idx:]
 
-        if not msg:
-            return None
+            try:
+                data = self.client.recv(self.recv_size)
+            except (socket.error, OSError):
+                return None
 
-        try:
-            msg_decoded = msg.decode("utf8")
-            left_bracket_index = msg_decoded.index("{")
-            right_bracket_index = msg_decoded.index("}") + 1
-            msg_decoded = msg_decoded[left_bracket_index:right_bracket_index]
-            msg_json = json.loads(msg_decoded)
-            return msg_json
-        except (ValueError, json.JSONDecodeError, UnicodeDecodeError) as e:
-            return None
+            if not data:
+                return None
+
+            self.recv_buffer += data.decode("utf8", errors="ignore")
+        return None
 
     def send_player(self, player):
         pos = (player.world_x, player.world_y, player.world_z)
-        player_info = {
+        self.queue_send({
             "object": "player",
             "id": self.id,
             "position": pos,
@@ -64,43 +111,23 @@ class Network:
             "health": player.health,
             "joined": False,
             "left": False
-        }
-        player_info_encoded = json.dumps(player_info).encode("utf8")
-
-        try:
-            self.client.send(player_info_encoded)
-        except socket.error as e:
-            print(e)
+        })
 
     def send_bullet(self, bullet):
-        bullet_info = {
+        self.queue_send({
             "object": "bullet",
             "position": (bullet.world_x, bullet.world_y, bullet.world_z),
             "damage": bullet.damage,
             "direction": bullet.direction,
             "x_direction": bullet.x_direction
-        }
-
-        bullet_info_encoded = json.dumps(bullet_info).encode("utf8")
-
-        try:
-            self.client.send(bullet_info_encoded)
-        except socket.error as e:
-            print(e)
+        })
 
     def send_health(self, player):
-        health_info = {
+        self.queue_send({
             "object": "health_update",
             "id": player.id,
             "health": player.health
-        }
-
-        health_info_encoded = json.dumps(health_info).encode("utf8")
-
-        try:
-            self.client.send(health_info_encoded)
-        except socket.error as e:
-            print(e)
+        })
 
     def send_respawn(self, position=(0, 1, 0), health=100):
         if hasattr(position, "x"):
@@ -108,17 +135,18 @@ class Network:
         else:
             pos = (position[0], position[1], position[2])
 
-        respawn_info = {
+        self.queue_send({
             "object": "respawn",
             "id": self.id,
             "position": pos,
             "health": health
-        }
+        })
 
-        respawn_info_encoded = json.dumps(respawn_info).encode("utf8")
-
+    def close(self):
+        self.running = False
         try:
-            self.client.send(respawn_info_encoded)
-        except socket.error as e:
-            print(e)
+            self.client.close()
+        except Exception:
+            pass
+
 

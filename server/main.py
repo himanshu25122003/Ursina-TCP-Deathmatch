@@ -9,17 +9,20 @@ import random
 import threading
 from art import *
 
-PORT = 8888 # this should be same as you define in playit.gg dashboard
+PORT = 8888  # this should be same as you define in playit.gg dashboard
 ADDR = "0.0.0.0"
 MAX_PLAYERS = 10
-MSG_SIZE = 2048
+MSG_SIZE = 4096
 
 # Setup server socket
 s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 s.bind((ADDR, PORT))
 s.listen(MAX_PLAYERS)
 
 players = {}
+players_lock = threading.Lock()
+
 
 def generate_id(player_list: dict, max_players: int):
     """
@@ -32,111 +35,129 @@ def generate_id(player_list: dict, max_players: int):
     Returns:
         str: the unique identifier
     """
-
     while True:
         unique_id = str(random.randint(1, max_players))
         if unique_id not in player_list:
             return unique_id
 
 
+def process_client_message(identifier: str, username: str, msg_json: dict):
+    obj_type = msg_json.get("object")
+
+    with players_lock:
+        if identifier not in players:
+            return
+
+        if obj_type == "player":
+            if "position" in msg_json:
+                players[identifier]["position"] = msg_json["position"]
+            if "rotation" in msg_json:
+                players[identifier]["rotation"] = msg_json["rotation"]
+            if "health" in msg_json:
+                players[identifier]["health"] = msg_json["health"]
+                players[identifier]["visible"] = msg_json["health"] > 0
+
+        elif obj_type == "respawn":
+            if "position" in msg_json:
+                players[identifier]["position"] = msg_json["position"]
+            players[identifier]["health"] = msg_json.get("health", 100)
+            players[identifier]["visible"] = True
+
+            respawn_msg = (json.dumps({
+                "object": "player_respawn",
+                "id": identifier,
+                "position": players[identifier]["position"],
+                "health": players[identifier]["health"]
+            }) + "\n").encode("utf8")
+
+            for player_id, p_info in list(players.items()):
+                if player_id != identifier:
+                    try:
+                        p_info["socket"].sendall(respawn_msg)
+                    except OSError:
+                        pass
+            return
+
+        elif obj_type == "health_update":
+            target_id = str(msg_json.get("id"))
+            if target_id in players:
+                players[target_id]["health"] = msg_json.get("health", 100)
+                players[target_id]["visible"] = players[target_id]["health"] > 0
+
+        # Broadcast to all other players with newline
+        broadcast_bytes = (json.dumps(msg_json) + "\n").encode("utf8")
+        for player_id, p_info in list(players.items()):
+            if player_id != identifier:
+                try:
+                    p_info["socket"].sendall(broadcast_bytes)
+                except OSError:
+                    pass
+
+
 def handle_messages(identifier: str):
-    client_info = players[identifier]
-    conn: socket.socket = client_info["socket"]
-    username = client_info["username"]
+    with players_lock:
+        if identifier not in players:
+            return
+        client_info = players[identifier]
+        conn: socket.socket = client_info["socket"]
+        username = client_info["username"]
+        recv_buffer = client_info.get("initial_buffer", "")
+
+    decoder = json.JSONDecoder()
 
     while True:
+        # First process any complete JSON objects already in buffer
+        idx = 0
+        while idx < len(recv_buffer):
+            while idx < len(recv_buffer) and recv_buffer[idx] in ' \t\r\n':
+                idx += 1
+            if idx >= len(recv_buffer):
+                recv_buffer = ""
+                break
+            try:
+                msg_json, end_idx = decoder.raw_decode(recv_buffer, idx)
+                recv_buffer = recv_buffer[end_idx:]
+                idx = 0
+            except json.JSONDecodeError:
+                recv_buffer = recv_buffer[idx:]
+                break
+
+            process_client_message(identifier, username, msg_json)
+
         try:
             msg = conn.recv(MSG_SIZE)
-        except ConnectionResetError:
+        except (ConnectionResetError, ConnectionAbortedError, OSError):
             break
 
         if not msg:
             break
 
-        msg_decoded = msg.decode("utf8")
+        recv_buffer += msg.decode("utf8", errors="ignore")
 
-        try:
-            left_bracket_index = msg_decoded.index("{")
-            right_bracket_index = msg_decoded.index("}") + 1
-            msg_decoded = msg_decoded[left_bracket_index:right_bracket_index]
-        except ValueError:
-            continue
+    # Tell other players about player leaving
+    leave_msg = (json.dumps({
+        "id": identifier,
+        "object": "player",
+        "joined": False,
+        "left": True
+    }) + "\n").encode("utf8")
 
-        try:
-            msg_json = json.loads(msg_decoded)
-        except Exception as e:
-            print(e)
-            continue
-
-        print(f"Received message from player {username} with ID {identifier}")
-
-        if msg_json["object"] == "player":
-            players[identifier]["position"] = msg_json["position"]
-            players[identifier]["rotation"] = msg_json["rotation"]
-            players[identifier]["health"] = msg_json["health"]
-
-            # Make player invisible if health is 0
-            if msg_json["health"] <= 0:
-                players[identifier]["visible"] = False
-            else:
-                players[identifier]["visible"] = True
-
-        elif msg_json["object"] == "respawn":
-            players[identifier]["position"] = msg_json["position"]
-            players[identifier]["health"] = msg_json["health"]
-            players[identifier]["visible"] = True
-
-            # Broadcast respawn event to other players
-            respawn_message = json.dumps({
-                "object": "player_respawn",
-                "id": identifier,
-                "position": players[identifier]["position"],
-                "health": players[identifier]["health"]
-            })
-
-            for player_id in list(players):
-                if player_id != identifier:
-                    player_info = players[player_id]
-                    player_conn: socket.socket = player_info["socket"]
-                    try:
-                        player_conn.sendall(respawn_message.encode("utf8"))
-                    except OSError:
-                        pass
-            continue
-
-        elif msg_json["object"] == "health_update":
-            target_id = str(msg_json.get("id"))
-            if target_id in players:
-                players[target_id]["health"] = msg_json["health"]
-                if msg_json["health"] <= 0:
-                    players[target_id]["visible"] = False
-                else:
-                    players[target_id]["visible"] = True
-
-        # Tell other players about player moving or visibility change
-        for player_id in list(players):
+    with players_lock:
+        for player_id, p_info in list(players.items()):
             if player_id != identifier:
-                player_info = players[player_id]
-                player_conn: socket.socket = player_info["socket"]
                 try:
-                    player_conn.sendall(msg_decoded.encode("utf8"))
+                    p_info["socket"].sendall(leave_msg)
                 except OSError:
                     pass
 
+        print(f"Player {username} with ID {identifier} has left the game...")
+        if identifier in players:
+            del players[identifier]
 
-    # Tell other players about player leaving
-    for player_id in list(players):
-        if player_id != identifier:
-            player_info = players[player_id]
-            player_conn: socket.socket = player_info["socket"]
-            try:
-                player_conn.send(json.dumps({"id": identifier, "object": "player", "joined": False, "left": True}).encode("utf8"))
-            except OSError:
-                pass
-
-    print(f"Player {username} with ID {identifier} has left the game...")
-    del players[identifier]
-    conn.close()
+    try:
+        conn.close()
+    except OSError:
+        pass
 
 
 def main():
@@ -148,64 +169,77 @@ def main():
     tprint(server_addr)
 
     while True:
-        # Accept new connection and assign unique ID
         conn, addr = s.accept()
-        new_id = generate_id(players, MAX_PLAYERS)
-        conn.send(new_id.encode("utf8"))
+        with players_lock:
+            new_id = generate_id(players, MAX_PLAYERS)
 
         try:
-            username = conn.recv(MSG_SIZE).decode("utf8")
-        except UnicodeDecodeError as e:
-            print(f"Failed to decode username: {e}")
+            conn.sendall(f"{new_id}\n".encode("utf8"))
+            raw_username = conn.recv(MSG_SIZE).decode("utf8", errors="ignore")
+        except Exception as e:
+            print(f"Handshake failed: {e}")
             conn.close()
             continue
 
-        new_player_info = {"socket": conn, "username": username, "position": (0, 1, 0), "rotation": 0, "health": 100, "visible": True}
+        if "\n" in raw_username:
+            username_parts = raw_username.split("\n", 1)
+            username = username_parts[0].strip()
+            initial_buffer = username_parts[1]
+        else:
+            username = raw_username.strip()
+            initial_buffer = ""
 
-        # Tell existing players about new player
-        for player_id in list(players):
-            if player_id != new_id:
-                player_info = players[player_id]
-                player_conn: socket.socket = player_info["socket"]
+        new_player_info = {
+            "socket": conn,
+            "username": username,
+            "position": (0, 1, 0),
+            "rotation": 0,
+            "health": 100,
+            "visible": True,
+            "initial_buffer": initial_buffer
+        }
+
+        with players_lock:
+            # Tell existing players about new player
+            new_player_msg = (json.dumps({
+                "id": new_id,
+                "object": "player",
+                "username": new_player_info["username"],
+                "position": new_player_info["position"],
+                "health": new_player_info["health"],
+                "joined": True,
+                "left": False
+            }) + "\n").encode("utf8")
+
+            for player_id, p_info in list(players.items()):
                 try:
-                    player_conn.send(json.dumps({
-                        "id": new_id,
-                        "object": "player",
-                        "username": new_player_info["username"],
-                        "position": new_player_info["position"],
-                        "health": new_player_info["health"],
-                        "joined": True,
-                        "left": False
-                    }).encode("utf8"))
+                    p_info["socket"].sendall(new_player_msg)
                 except OSError:
                     pass
 
-        # Tell new player about existing players
-        for player_id in list(players):
-            if player_id != new_id:
-                player_info = players[player_id]
+            # Tell new player about existing players
+            for player_id, p_info in list(players.items()):
+                existing_msg = (json.dumps({
+                    "id": player_id,
+                    "object": "player",
+                    "username": p_info["username"],
+                    "position": p_info["position"],
+                    "rotation": p_info.get("rotation", 0),
+                    "health": p_info["health"],
+                    "joined": True,
+                    "left": False
+                }) + "\n").encode("utf8")
                 try:
-                    conn.send(json.dumps({
-                        "id": player_id,
-                        "object": "player",
-                        "username": player_info["username"],
-                        "position": player_info["position"],
-                        "health": player_info["health"],
-                        "joined": True,
-                        "left": False
-                    }).encode("utf8"))
-                    time.sleep(0.1)
+                    conn.sendall(existing_msg)
                 except OSError:
                     pass
 
-        # Add new player to players list, effectively allowing it to receive messages from other players
-        players[new_id] = new_player_info
+            players[new_id] = new_player_info
 
-        # Start thread to receive messages from client
         msg_thread = threading.Thread(target=handle_messages, args=(new_id,), daemon=True)
         msg_thread.start()
 
-        print(f"New connection from {addr}, assigned ID: {new_id}...")
+        print(f"New connection from {addr}, assigned ID: {new_id} ({username})...")
 
 
 if __name__ == "__main__":
@@ -214,7 +248,7 @@ if __name__ == "__main__":
             main()
         except KeyboardInterrupt:
             print("Server stopped manually.")
-            break  # Allow graceful shutdown on Ctrl+C
+            break
         except SystemExit:
             print("System exit triggered.")
             break
@@ -224,3 +258,4 @@ if __name__ == "__main__":
             time.sleep(5)
         finally:
             s.close()
+
